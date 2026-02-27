@@ -346,6 +346,7 @@ def _(jax, jnp, np):
     # Wrap wasserstein_distance with pure_callback for JAX compatibility
     def wasserstein_distance(a, b):
         from scipy.stats import wasserstein_distance as _wasserstein_distance
+
         def _compute(a, b):
             a_np = np.asarray(a)
             b_np = np.asarray(b)
@@ -354,6 +355,7 @@ def _(jax, jnp, np):
                 return _wasserstein_distance(a_np, b_np)
             else:
                 return np.array([_wasserstein_distance(x, b_np) for x in a_np])
+
         if a.ndim == 1:
             out_shape = jax.ShapeDtypeStruct((), jnp.float32)
         else:
