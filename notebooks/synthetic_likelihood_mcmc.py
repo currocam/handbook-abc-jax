@@ -140,16 +140,27 @@ def _(az, dist, jax, jnp, jss, np):
 
         def _compute_log_prob(theta, sim_key):
             sim_keys = jax.random.split(sim_key, num_replicates)
-            _, s_replicates = jax.lax.scan(
-                lambda _, k: (
-                    None,
-                    jnp.atleast_1d(summary_stat(simulator(k, {"theta": theta}))),
-                ),
-                None,
-                sim_keys,
-            )
             lp = log_prior_density({"theta": theta})
-            ll = log_synlik_fn(s_replicates, s_obs_vec)
+            # Return early if prior is -inf to avoid unnecessary simulations
+            lp = jnp.where(jnp.isfinite(lp), lp, -jnp.inf)
+
+            def fn(theta, sim_key):
+                _, s_replicates = jax.lax.scan(
+                    lambda _, k: (
+                        None,
+                        jnp.atleast_1d(summary_stat(simulator(k, {"theta": theta}))),
+                    ),
+                    None,
+                    sim_keys,
+                )
+                return log_synlik_fn(s_replicates, s_obs_vec)
+
+            ll = jax.lax.cond(
+                jnp.isfinite(lp).squeeze(),
+                lambda _: fn(theta, sim_key),
+                lambda _: -jnp.inf,
+                operand=lp,
+            )
             return jnp.squeeze(lp + ll)
 
         def _run_chain(args):
@@ -207,15 +218,15 @@ def _(mo):
     mo.md(r"""
     ## Example (from the book)
 
-    Suppose the model is specified as $y_1, \dots, y_{50} \sim N(\theta, 1)$, with uniform prior $\theta \sim U(-5, 5)$.
+    Suppose the model is specified as $y_1, \dots, y_{50} \sim \text{Poisson}(\theta)$, with uniform prior $\theta \sim U(0, 10)$.
     """)
     return
 
 
 @app.cell
-def _(dist, jr):
+def _(dist, jnp, jr):
     theta_true = 2.5
-    observed_y = dist.Normal(theta_true, 1).sample(jr.key(1), (50,))
+    observed_y = dist.Poisson(theta_true).sample(jr.key(1), (50,)).astype(jnp.float32)
     observed_y
     return (observed_y,)
 
@@ -223,7 +234,7 @@ def _(dist, jr):
 @app.cell
 def _(dist, jnp):
     # Define prior distribution
-    prior = dist.Uniform(-5, 5)
+    prior = dist.Uniform(0, 10, validate_args=True)
     log_prior_density = lambda params: prior.log_prob(params["theta"])
     # Sufficient summary statistic
     summary_stat = lambda y: jnp.mean(y)
@@ -249,7 +260,7 @@ def _(jax, jnp):
         np.random.seed(seed)
         n_obs = 50
         theta_val = float(np.squeeze(np.asarray(params["theta"])))
-        y = np.random.normal(theta_val, 1.0, n_obs)
+        y = np.random.poisson(theta_val, n_obs).astype(np.float32)
         return jnp.array(y)
 
     def simulator(key, params):
@@ -285,8 +296,8 @@ def _(
 ):
     s_obs = jnp.atleast_1d(summary_stat(observed_y))
     init_pos_bsl = [
-        {"theta": jnp.array([-3.0])},
-        {"theta": jnp.array([-1.0])},
+        {"theta": jnp.array([2.0])},
+        {"theta": jnp.array([4.0])},
         {"theta": jnp.array([1.0])},
         {"theta": jnp.array([3.0])},
     ]
@@ -339,24 +350,21 @@ def _(
     summary_stat,
     synthetic_likelihood_mcmc,
 ):
-    # uBSL is only finite when |θ - μ_n| is small enough for A to be PD.
-    # With n=50 replicates the valid radius is ~0.98, so initialise near s_obs.
-    _s = float(s_obs[0])
     init_pos_ubsl = [
-        {"theta": jnp.array([_s - 0.6])},
-        {"theta": jnp.array([_s - 0.2])},
-        {"theta": jnp.array([_s + 0.2])},
-        {"theta": jnp.array([_s + 0.6])},
+        {"theta": jnp.array([2.0])},
+        {"theta": jnp.array([4.0])},
+        {"theta": jnp.array([1.0])},
+        {"theta": jnp.array([3.0])},
     ]
     posterior_ubsl = synthetic_likelihood_mcmc(
         key=jr.key(1),
         log_prior_density=log_prior_density,
         # We need higher proposal variance because uBSL returns infinite log-likelihoods far from s_obs
-        proposal_covariance=jnp.array([[1.0]]),
+        proposal_covariance=jnp.array([[0.2]]),
         initial_positions=init_pos_ubsl,
         simulator=simulator,
         summary_stat=summary_stat,
-        num_replicates=5,  # Minimum number of replicates
+        num_replicates=5,
         num_samples=4000,
         s_obs=s_obs,
         log_synlik_fn=log_synlik_ubsl,
@@ -426,7 +434,7 @@ def _(
 
 
 @app.cell
-def _(dist, jnp, jr, observed_y, plt, posterior_bsl, posterior_ubsl, sns):
+def _(dist, jr, observed_y, plt, posterior_bsl, posterior_ubsl, sns):
     sns.kdeplot(
         posterior_bsl.posterior["theta"].values.flatten(),
         alpha=0.6,
@@ -440,12 +448,12 @@ def _(dist, jnp, jr, observed_y, plt, posterior_bsl, posterior_ubsl, sns):
         label="uBSL Posterior",
     )
     # Exact conjugate posterior
-    _posterior_exact = dist.Normal(observed_y.mean(), 1 / jnp.sqrt(50)).sample(
-        jr.key(1), (5000,)
-    )
+    _posterior_exact = dist.Gamma(
+        concentration=observed_y.sum() + 1, rate=len(observed_y)
+    ).sample(jr.key(1), (5000,))
     _posterior_exact = _posterior_exact[
-        (_posterior_exact >= -5) & (_posterior_exact <= 5)
-    ]
+        _posterior_exact < 10
+    ]  # truncate to match prior support]
     sns.kdeplot(_posterior_exact, alpha=0.6, color="C2", label="Exact Posterior")
     plt.legend()
     plt.gca()

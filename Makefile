@@ -6,7 +6,7 @@ format:
 check:
 	uvx marimo check
 
-export-all:
+export:
 	printf '%s\n' notebooks/*.py | xargs -P 4 -I{} sh -c '\
 		ipynb="$${1%.py}.ipynb"; \
 		run=0; \
@@ -19,4 +19,4 @@ export-all:
 			uv run jupyter nbconvert --to notebook --execute --inplace "$$ipynb"; \
 		fi' _ {}
 
-all: format check export-all
+all: format check export
