@@ -33,6 +33,9 @@ def _(mo):
 
 @app.cell
 def _(blackjax, jax, jnp, np):
+    from blackjax.smc import adaptive_tempered, resampling, solver
+    from blackjax.smc.tempered import init as smc_init
+
     def gaussian_kernel(u):
         """Gaussian kernel: 1/√(2π) * exp(-u²/2)"""
         return (1 / jnp.sqrt(2 * jnp.pi)) * jnp.exp(-0.5 * u**2)
@@ -44,16 +47,16 @@ def _(blackjax, jax, jnp, np):
         num_particles,
         s_obs,
         distance,
+        proposal_covariance,
+        prior_sample,
         summary_stat=lambda x: x,
-        kernel=gaussian_kernel,
+        abc_kernel=gaussian_kernel,
         h=1.0,
-        proposal_covariance=None,
         target_ess=0.5,
         num_mcmc_steps=10,
-        prior_sample=None,
     ):
         """
-        ABC Sequential Monte Carlo using blackjax's adaptive_tempered_smc.
+        ABC Sequential Monte Carlo using blackjax's adaptive tempered SMC.
 
         The simulator should be wrapped with jax.pure_callback by the user
         for JAX compatibility.
@@ -61,16 +64,16 @@ def _(blackjax, jax, jnp, np):
         Args:
             key: JAX random key
             log_prior_density: function log π(θ) computing log prior density
-            prior_sample: function (key, num_particles) -> dict of initial particles
-            simulator: JAX-compatible function (params) -> y
+            simulator: JAX-compatible function (key, params) -> y
                       (should be wrapped with jax.pure_callback if using numpy/scipy)
             num_particles: number of particles for SMC
             s_obs: observed summary statistics
             distance: distance function (s_sim, s_obs) -> scalar
+            proposal_covariance: covariance matrix for MCMC proposal
+            prior_sample: function (key, num_particles) -> dict of initial particles
             summary_stat: function S(y) computing summary statistics
-            kernel: kernel function K(u)
+            abc_kernel: kernel function K(u)
             h: bandwidth parameter for kernel
-            proposal_covariance: covariance matrix for proposal
             target_ess: target effective sample size ratio
             num_mcmc_steps: number of MCMC steps per SMC iteration
 
@@ -78,26 +81,12 @@ def _(blackjax, jax, jnp, np):
             az.InferenceData with posterior samples
         """
         import arviz as az
-        from blackjax import adaptive_tempered_smc
-        from blackjax.smc import resampling, solver
 
-        def inference_loop_mcmc(rng_key, kernel, initial_state, num_samples):
-            @jax.jit
-            def one_step(state, rng_key):
-                state, _ = kernel(rng_key, state)
-                return state, state
-
-            keys = jax.random.split(rng_key, num_samples)
-            _, states = jax.lax.scan(one_step, initial_state, keys)
-
-            return states
-
-        # Proposal covariance must be provided for SMC
-        if proposal_covariance is None:
-            raise ValueError("proposal_covariance must be provided")
-
-        # Create ABC loglikelihood (pure JAX)
         s_obs_vec = jnp.atleast_1d(s_obs)
+
+        mcmc_init_fn = blackjax.additive_step_random_walk.normal_random_walk(
+            lambda x: 0.0, proposal_covariance
+        ).init
 
         def mcmc_step(key, state, logdensity):
             """MCMC step using random walk"""
@@ -108,36 +97,11 @@ def _(blackjax, jax, jnp, np):
 
         # Sample initial particles from prior
         key_particles, key_inference = jax.random.split(key)
-
-        # User-provided prior sampling function
         initial_particles = prior_sample(key_particles, num_particles)
-
-        # Initial kernel for first iteration (dummy key, will be replaced in loop)
-        def abc_loglik_dummy(params):
-            _, subkey = jax.random.split(jax.random.key(0))
-            sim = simulator(subkey, params)
-            s_sim = jnp.atleast_1d(summary_stat(sim))
-            d = distance(s_sim, s_obs_vec)
-            k_val = kernel(d / h)
-            log_k = jnp.log(k_val)
-            return log_k
-
-        kernel_smc_init = adaptive_tempered_smc(
-            log_prior_density,
-            abc_loglik_dummy,
-            mcmc_step,
-            blackjax.additive_step_random_walk.normal_random_walk(
-                lambda x: 0.0, proposal_covariance
-            ).init,
-            mcmc_parameters={},
-            resampling_fn=resampling.systematic,
-            target_ess=target_ess,
-            root_solver=solver.dichotomy,
-            num_mcmc_steps=num_mcmc_steps,
-        )
+        initial_state = smc_init(initial_particles)
 
         # Run SMC inference
-        def inference_loop(rng_key, initial_particles):
+        def inference_loop(rng_key, state):
             """Run SMC until tempering_param reaches 1"""
 
             def cond(carry):
@@ -146,42 +110,35 @@ def _(blackjax, jax, jnp, np):
 
             def body(carry):
                 i, state, op_key = carry
-                op_key, loglik_key, mcmc_key = jax.random.split(op_key, 3)
+                op_key, loglik_key, step_key = jax.random.split(op_key, 3)
 
                 # Fresh abc_loglik with its own key each iteration
                 def abc_loglik(params):
-                    _, subkey = jax.random.split(loglik_key)
-                    sim = simulator(subkey, params)
+                    sim = simulator(loglik_key, params)
                     s_sim = jnp.atleast_1d(summary_stat(sim))
                     d = distance(s_sim, s_obs_vec)
-                    k_val = kernel(d / h)
-                    log_k = jnp.log(k_val)
-                    return log_k
+                    return jnp.log(abc_kernel(d / h))
 
-                # Recreate kernel with fresh loglik
-                kernel_smc = adaptive_tempered_smc(
+                # Rebuild kernel with fresh loglik closure
+                smc_kernel = adaptive_tempered.build_kernel(
                     log_prior_density,
                     abc_loglik,
                     mcmc_step,
-                    blackjax.additive_step_random_walk.normal_random_walk(
-                        lambda x: 0.0, proposal_covariance
-                    ).init,
-                    mcmc_parameters={},
-                    resampling_fn=resampling.systematic,
-                    target_ess=target_ess,
-                    root_solver=solver.dichotomy,
-                    num_mcmc_steps=num_mcmc_steps,
+                    mcmc_init_fn,
+                    resampling.systematic,
+                    target_ess,
+                    solver.dichotomy,
                 )
 
-                state, info = kernel_smc.step(mcmc_key, state)
+                state, info = smc_kernel(step_key, state, num_mcmc_steps, {})
                 return (i + 1, state, op_key)
 
             total_iter, final_state, _ = jax.lax.while_loop(
-                cond, body, (0, kernel_smc_init.init(initial_particles), rng_key)
+                cond, body, (0, state, rng_key)
             )
             return final_state.particles
 
-        particles = inference_loop(key_inference, initial_particles)
+        particles = inference_loop(key_inference, initial_state)
 
         # Convert to InferenceData
         posterior = az.from_dict(
@@ -291,15 +248,15 @@ def _(
     posterior_abc_sf = abc_smc(
         key=jr.key(0),
         log_prior_density=log_prior_density,
-        prior_sample=prior_sample,
         simulator=simulator,
         num_particles=200,
         s_obs=s_obs,
         distance=lambda s, s_obs: jnp.linalg.norm(s - s_obs, axis=-1),
-        summary_stat=summary_stat,
-        kernel=gaussian_kernel,
-        h=0.1,
         proposal_covariance=jnp.array([[0.1]]),
+        prior_sample=prior_sample,
+        summary_stat=summary_stat,
+        abc_kernel=gaussian_kernel,
+        h=0.1,
         target_ess=0.5,
         num_mcmc_steps=30,
     )
@@ -381,15 +338,15 @@ def _(
     posterior_abc_ws = abc_smc(
         key=jr.key(42),
         log_prior_density=log_prior_density,
-        prior_sample=prior_sample,
         simulator=simulator,
         num_particles=200,
         s_obs=observed_y,
         distance=wasserstein_distance,
-        summary_stat=lambda x: x,  # Identity: use raw data
-        kernel=gaussian_kernel,
-        h=0.2,
         proposal_covariance=jnp.array([[0.1]]),
+        prior_sample=prior_sample,
+        summary_stat=lambda x: x,  # Identity: use raw data
+        abc_kernel=gaussian_kernel,
+        h=0.2,
         target_ess=0.5,
         num_mcmc_steps=30,
     )
