@@ -13,15 +13,15 @@ def _():
     jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
     import jax.random as jr
-    import jax.scipy.special as jss
     import marimo as mo
     import matplotlib.pyplot as plt
     import numpy as np
     import numpyro.distributions as dist
-    import seaborn as sns
+
+    from emplik import calc_log_ael
 
     azp.style.use("arviz-vibrant")
-    return az, dist, jax, jnp, jr, mo, np, plt
+    return az, calc_log_ael, dist, jax, jnp, jr, mo, np, plt
 
 
 @app.cell(hide_code=True)
@@ -36,125 +36,20 @@ def _(mo):
 
     Empirical likelihoods can be used to do approximate statistical inference without making strong parametric assumptions about the data generating process. Rather than assuming that a certain distribution (e.g., normal, Poisson) generated the data, we can specify moment conditions that the data should satisfy (e.g., mean) and use empirical likelihoods to perform inference based on these moments.
 
-    This idea was introduced in the late 1980s. The appealing thing is that the empirical likelihood shares some assymptotic properties with the actual likelihood. However, it's not widely used (I think), I wonder why. In this notebook I use the log-adjusted empirical likelihood following the R implementation in https://github.com/jlimrasc/VBel. Optimization is done with an efficient algorithm (solving the Lagrangian dual problem) and it is JIT compiled using JAX which means that hopefully is not too slow and we can take advantage of automatic differentiation.
-
-    Below, some details about the implementatin:
-
-    ### Adjusted empirical likelihood implementation
-
-    Evaluates the Log-Adjusted Empirical Likelihood (AEL) (Chen, Variyath, and Abraham 2008) for a given data set, moment conditions and parameter values.
-    The AEL function is formulated as
-
-    $$
-    \log \text{AEL}(\boldsymbol{\theta}) = \max_{\mathbf{w}'} \sum\limits_{i=1}^{n+1} \log(w_i'),
-    $$
-
-    where $\mathbf{z}_{n+1}$ is a pseudo-observation that satisfies
-
-    $$
-    h(\mathbf{z}_{n+1}, \boldsymbol{\theta}) = -\frac{a_n}{n} \sum\limits_{i=1}^n h(\mathbf{z}_i, \boldsymbol{\theta})
-    $$
-
-    for some constant $a_n > 0$ that may (but not necessarily) depend on $n$, and $\mathbf{w}' = (w_1', \ldots, w_n', w_{n+1}')$ is a vector of probability weights that define a discrete distribution on $\{\mathbf{z}_1, \ldots, \mathbf{z}_n, \mathbf{z}_{n+1}\}$, and are subject to the constraints
-
-    $$
-    \sum\limits_{i=1}^{n+1} w_i' h(\mathbf{z}_i, \boldsymbol{\theta}) = 0, \quad \text{and} \quad \sum\limits_{i=1}^{n+1} w_i' = 1.
-    $$
-
-    Here, the maximizer $\tilde{\mathbf{w}}$ is of the form
-
-    $$
-    \tilde{w}_i = \frac{1}{n+1} \frac{1}{1 + \lambda_{\text{AEL}}^\top h(\mathbf{z}_i, \boldsymbol{\theta})},
-    $$
-
-    where $\lambda_{\text{AEL}}$ satisfies the constraints
-
-    $$
-    \frac{1}{n+1} \sum\limits_{i=1}^{n+1} \frac{h(\mathbf{z}_i, \boldsymbol{\theta})}{1 + \lambda_{\text{AEL}}^\top h(\mathbf{z}_i, \boldsymbol{\theta})} = 0, \quad \text{and} \quad
-    \frac{1}{n+1} \sum\limits_{i=1}^{n+1} \frac{1}{1 + \lambda_{\text{AEL}}^\top h(\mathbf{z}_i, \boldsymbol{\theta})} = 1.
-    $$
+    This idea was introduced in the late 1980s. The appealing thing is that the empirical likelihood shares some assymptotic properties with the actual likelihood. However, it's not widely used (I think), I wonder why. In this notebook I use the log-adjusted empirical likelihood following the jax implementation in [https://github.com/weiyaw/epel/blob/main/emplik.py](https://github.com/weiyaw/epel/blob/main/emplik.py).
     """)
     return
 
 
 @app.cell
-def _(jax, jnp):
-    @jax.jit
-    def _adjusted_empirical_loglikelihood(data, moments):
-        # Moment condition
-        data = data - moments
-        # Empirical likelihoods have a different support than the "original" likelihoods
-        # This is because some parameter combinations cannot satisfy the moment conditions
-        # and therefore have zero empirical likelihood. This makes optimization difficult.
-        # To alleviate this problem, we add a pseudo-observation to the data set. If
-        # a is small (in the orden of log(n)), we still get a good (assymptotic) approximation
-        # but the support of the empirical likelihood is extended to the whole parameter space.
-        # Pseudo-observation
-        n1 = data.shape[0]
-        a = 0.5 * jnp.log(n1)
-        pseudo_observation = -a / n1 * moments.sum()
-        pseudo_col = jnp.atleast_2d(pseudo_observation)
-        # Add pseudo-observation to data
-        data_col = jnp.atleast_2d(data).reshape(-1, 1)
-        h_array = jnp.concatenate([data_col, pseudo_col]).reshape((-1, 1))
-        # Compute lambda using modified Newton-Raphson
-        n = h_array.shape[0]
-        d = h_array.shape[1]
-
-        def newton_step(lam_prev, _):
-            # Original Rccp code in comments for reference
-            # wi = 1 / (1 + lam^T h_i)
-            # wi = pow((1 + lam_prev.transpose() * h_list[i]),-1);
-            h_lam = (h_array @ lam_prev).ravel()
-            wi_arr = 1.0 / (1.0 + h_lam)
-            assert wi_arr.shape == (n,)
-            # Condition 1
-            # if (pow(wi,-1) >= 1.0/(double)n)
-            threshold = 1.0 / n
-            condition = (1.0 / wi_arr) >= threshold
-            # vi and vi2 computation
-            vi = jnp.where(condition, wi_arr, 2 * n - (n**2) / wi_arr)
-            v2 = jnp.where(condition, wi_arr, n)
-            # dF += vi * h_list[i];
-            dF = jnp.sum(vi.reshape(-1, 1) * h_array, axis=0)
-            assert dF.shape == (d,)
-            # D_arr[i] = pow(vi2,2);
-            D_arr = v2**2
-            assert D_arr.shape == (n,)
-            # D = D_arr.asDiagonal();
-            # // Calculate P (i.e. d2F)
-            # P = -H_Zth.transpose() * D * H_Zth;
-            # P = - h_array.T @ jnp.diag(D_arr) @ h_array
-            # Perhaps it's more efficient to use einsum??
-            P = -jnp.einsum("ni,n,nj->ij", h_array, D_arr, h_array)
-            assert P.shape == (d, d)
-            # lam_prev = lam_prev - P.inverse() * dF;
-            lam_new = lam_prev - jnp.linalg.solve(P, dF)
-            # Carry, output
-            return lam_new, None
-
-        lam0 = jnp.zeros((d,))
-        num_steps = 50
-        lam_final, _ = jax.lax.scan(newton_step, lam0, None, length=num_steps)
-        # AEL calculation
-        # for (int i = 0; i < n; i++) {
-        #    accum += log(1.0 + (lambda.transpose() * h_list[i])[0]); // Get double vs mat hence [0]
-        # }
-        accum = jnp.sum(jnp.log(1.0 + jnp.dot(h_array, lam_final)))
-        # Numerically more stable using log1p?
-        accum = jnp.sum(jnp.log1p((h_array @ lam_final).ravel()))
-        # accum = jnp.sum(jnp.log1p(h_array @ lam_final))
-        # log_AEL = -(accum + n * log(n));
-        log_AEL = -(accum + n * jnp.log(n))
-        return log_AEL
+def _(calc_log_ael, jax, jnp):
+    def h_poisson(z, theta):
+        return jnp.atleast_1d(z - theta[0])
 
     @jax.jit
-    def adjusted_empirical_loglikelihood(dataset, moments):
-        fun = lambda theta: _adjusted_empirical_loglikelihood(
-            dataset, theta.reshape((1, -1))
-        )
-        # return jnp.nan_to_num(jax.vmap(fun)(moments), nan=-jnp.inf)
-        return jax.vmap(fun)(moments)
+    def adjusted_empirical_loglikelihood(data, theta):
+        a_n = 0.5 * jnp.log(data.shape[0])
+        return calc_log_ael(h_poisson, data, theta, a_n, check_sum_to_1=False)
 
     return (adjusted_empirical_loglikelihood,)
 

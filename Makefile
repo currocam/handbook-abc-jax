@@ -1,13 +1,13 @@
-.PHONY: format check export-all all
+.PHONY: format check export all
 
 format:
 	uvx ruff format
 
 check:
-	uvx marimo check
+	grep -rl "marimo\.App" notebooks/*.py | xargs uvx marimo check
 
 export:
-	printf '%s\n' notebooks/*.py | xargs -P 4 -I{} sh -c '\
+	grep -rl "marimo\.App" notebooks/*.py | xargs -P 4 -I{} sh -c '\
 		ipynb="$${1%.py}.ipynb"; \
 		run=0; \
 		[ "$$1" -nt "$$ipynb" ] && run=1; \

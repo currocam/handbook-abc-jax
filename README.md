@@ -6,8 +6,7 @@ This repository contains various ABC algorithms (from the [bible of ABC](https:/
 
 ## TODO
 
-1. [Expectation-propagation algorithms for likelihood-free inference](https://arxiv.org/abs/1512.00205)
-2. [Inverse Binomial Sampling](https://arxiv.org/abs/2001.03985)
+1. [Inverse Binomial Sampling](https://arxiv.org/abs/2001.03985)
 
 ## Caveat Emptor
 
